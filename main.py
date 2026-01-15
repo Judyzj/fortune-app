@@ -168,15 +168,10 @@ def get_current_user_id(
     # 4. 使用 "default_user"（仅开发环境，不安全）
     env = os.getenv("ENV", "development")
     if env == "production":
-        # 生产环境：如果没有提供有效的身份信息，返回 401
-        # 但为了内网环境的兼容性，允许使用 IP + User-Agent 生成临时用户ID
-        # 注意：这不是真正的身份验证，仅用于内网环境下的用户隔离
-        from fastapi import Request
-        # 这里需要从请求中获取 Request 对象，但当前函数签名不支持
-        # 所以生产环境仍然要求提供 token
+        # 生产环境必须提供有效的 JWT token
         raise HTTPException(
             status_code=401,
-            detail="生产环境必须提供有效的身份验证信息（JWT token 或 user_id）"
+            detail="生产环境必须提供有效的 JWT token 进行身份验证"
         )
     else:
         print(f"⚠️  开发环境：使用默认用户ID 'default_user'（不安全，仅用于开发）", flush=True)
@@ -1620,13 +1615,17 @@ async def save_fortune_book(
 
 
 @app.post("/api/generate-kline")
-async def generate_kline(request: KLineGenerateRequest):
+async def generate_kline(
+    request: KLineGenerateRequest,
+    authorization: Optional[str] = Header(None),
+    user_id: Optional[str] = None
+):
     """
     生成人生K线数据
     
     支持两种入参方式：
-    1. 传 book_id：从数据库查询八字信息
-    2. 传 birth_data：直接使用表单数据
+    1. 传 book_id：从数据库查询八字信息（需要权限验证，只能使用自己的命书）
+    2. 传 birth_data：直接使用表单数据（无需权限验证）
     
     无论哪种方式，最终都调用相同的 LLM Service 逻辑生成K线数据
     """
@@ -1638,6 +1637,16 @@ async def generate_kline(request: KLineGenerateRequest):
             book = db.query(FortuneBook).filter(FortuneBook.id == request.book_id).first()
             if not book:
                 raise HTTPException(status_code=404, detail="命书不存在")
+            
+            # 用户权限检查：确保用户只能使用自己的命书
+            current_user_id = get_current_user_id(authorization=authorization, user_id=user_id)
+            if book.user_id != current_user_id:
+                print(f"❌ 权限拒绝：用户 {current_user_id} 尝试使用用户 {book.user_id} 的命书生成K线", flush=True)
+                raise HTTPException(
+                    status_code=403,
+                    detail="无权访问：该命书不属于当前用户"
+                )
+            print(f"✅ 权限验证通过：用户 {current_user_id} 使用自己的命书生成K线", flush=True)
             
             # 从数据库获取数据
             name = book.person_name
@@ -1675,16 +1684,23 @@ async def generate_kline(request: KLineGenerateRequest):
             gender=gender
         )
         
-        # 2. 直接生成 K 线数据（跳过不必要的 call_llm_for_structured_data 调用，提升速度）
-        # 注意：K线生成只需要八字数据，不需要先调用结构化数据接口
-        if not compass_client and not deepseek_api_key:
+        # 2. 调用 LLM 获取结构化的命理分析数据（复用现有逻辑）
+        llm_data = await call_llm_for_structured_data(
+            bazi_report,
+            name,
+            gender,
+            city,
+            birth_date,
+            birth_time
+        )
+        
+        # 3. 构建 K 线生成专用的 System Prompt（使用完整的八字数据）
+        # 4. 调用 LLM 生成 K 线解读（必须使用真实八字，不能是 Mock）
+        if not compass_client:
             raise HTTPException(
                 status_code=500,
-                detail="AI API 未配置，无法生成 K 线数据"
+                detail="Compass API 未配置，无法生成 K 线数据"
             )
-        
-        # 优化：使用非流式API调用，添加超时保护，提高稳定性
-        print(f"📊 开始生成 K 线数据（优化版本，30秒超时）", flush=True)
         
         # 构建精简的 K 线 Prompt（只要求 JSON 输出，提速）
         # 提取关键八字信息
@@ -1753,69 +1769,106 @@ async def generate_kline(request: KLineGenerateRequest):
         # 调用 LLM API（流式，先传输分析文本，最后传输JSON数据）
         print(f"📊 开始调用 LLM 生成 K 线数据（流式模式）", flush=True)
         
-        # 优化：使用非流式API调用（更快更稳定），添加30秒超时
-        print(f"📊 开始调用 LLM 生成 K 线数据（非流式模式，30秒超时）", flush=True)
-        
-        import asyncio
-        
-        # 调用AI API（非流式，带超时）
-        ai_response = None
-        ai_call_success = False
-        
-        # 首先尝试 Compass API（非流式）
-        if compass_client:
-            try:
-                print("🔄 调用 Compass API（非流式，30秒超时）...", flush=True)
-                
-                async def call_compass():
-                    response = compass_client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=kline_prompt,
-                        config={
-                            "response_mime_type": "application/json",
-                            "temperature": 0.7,
-                            "max_output_tokens": 2000
-                        }
-                    )
-                    if hasattr(response, 'text'):
-                        return response.text
-                    elif hasattr(response, 'candidates') and response.candidates:
-                        if hasattr(response.candidates[0], 'content'):
-                            if hasattr(response.candidates[0].content, 'parts'):
-                                return ''.join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
-                    return None
-                
+        # 流式返回结果
+        async def generate_kline_stream():
+            """流式生成K线数据的生成器函数"""
+            # 确保 current_age 在函数内部可访问（从外部作用域获取）
+            nonlocal current_age
+            response_text = ""
+            ai_call_success = False
+            
+            # 首先尝试 Compass API（流式）
+            if compass_client:
                 try:
-                    # 增加超时时间到60秒
-                    ai_response = await asyncio.wait_for(call_compass(), timeout=60.0)
-                    if ai_response:
-                        ai_call_success = True
-                        print(f"✅ Compass API 调用成功，返回长度: {len(ai_response)}", flush=True)
-                except asyncio.TimeoutError:
-                    print("⏰ Compass API 调用超时（60秒）", flush=True)
-                except Exception as e:
-                    print(f"❌ Compass API 调用失败: {e}", flush=True)
-            except Exception as e:
-                print(f"❌ Compass API 异常: {e}", flush=True)
-        
-        # 如果Compass失败，尝试DeepSeek（非流式）
-        if not ai_call_success and deepseek_api_key:
-            try:
-                print("🔄 调用 DeepSeek API（非流式，30秒超时）...", flush=True)
-                import httpx
+                    print("🔄 尝试使用 Compass API（流式）...", flush=True)
+                    stream = None
+                    try:
+                        # 使用流式API
+                        stream = compass_client.models.generate_content_stream(
+                            model="gemini-2.5-flash",
+                            contents=kline_prompt,
+                            config={
+                                "response_mime_type": "application/json"
+                            }
+                        )
+                        print("✅ 使用流式 API（JSON 模式）", flush=True)
+                    except (TypeError, AttributeError) as e1:
+                        try:
+                            # 回退方案：不使用JSON模式，直接流式
+                            stream = compass_client.models.generate_content_stream(
+                                model="gemini-2.5-flash",
+                                contents=kline_prompt
+                            )
+                            print("✅ 使用流式 API（默认模式）", flush=True)
+                        except Exception as e2:
+                            print(f"⚠️  流式 API 调用失败: {e2}", flush=True)
+                            stream = None
                 
-                async def call_deepseek():
+                    # 发送进度：30%（开始调用AI）
+                    yield f"data: {json.dumps({'type': 'progress', 'progress': 30}, ensure_ascii=False)}\n\n"
+                    
+                    # 流式处理响应
+                    if stream:
+                        try:
+                            chunk_count = 0
+                            for chunk in stream:
+                                chunk_text = ""
+                                if hasattr(chunk, 'text'):
+                                    chunk_text = chunk.text
+                                elif hasattr(chunk, 'candidates') and chunk.candidates:
+                                    if hasattr(chunk.candidates[0], 'content'):
+                                        if hasattr(chunk.candidates[0].content, 'parts'):
+                                            for part in chunk.candidates[0].content.parts:
+                                                if hasattr(part, 'text'):
+                                                    chunk_text += part.text
+                                
+                                if chunk_text:
+                                    response_text += chunk_text
+                                    chunk_count += 1
+                                    # 每收到20个chunk，更新一次进度（30% -> 70%）
+                                    if chunk_count % 20 == 0:
+                                        progress = min(30 + int((chunk_count / 60) * 40), 70)
+                                        yield f"data: {json.dumps({'type': 'progress', 'progress': progress}, ensure_ascii=False)}\n\n"
+                            
+                            if response_text:
+                                print(f"✅ Compass API 流式调用成功，返回内容长度: {len(response_text)}", flush=True)
+                                ai_call_success = True
+                                # 发送进度：70%（AI调用完成）
+                                yield f"data: {json.dumps({'type': 'progress', 'progress': 70}, ensure_ascii=False)}\n\n"
+                        except Exception as stream_error:
+                            print(f"❌ 流式处理错误: {stream_error}", flush=True)
+                            stream = None
+                    else:
+                        print(f"⚠️  流式 API 调用失败，stream 为 None", flush=True)
+                        
+                except Exception as compass_error:
+                    error_msg = str(compass_error)
+                    print(f"❌ Compass API 调用失败: {error_msg}", flush=True)
+                    
+                    # 检查是否是余额不足或其他可恢复错误
+                    if "balance" in error_msg.lower() or "402" in error_msg or "quota" in error_msg.lower():
+                        print("⚠️  Compass API 余额不足，尝试使用 DeepSeek API 作为备用...", flush=True)
+                    else:
+                        print("⚠️  Compass API 调用异常，尝试使用 DeepSeek API 作为备用...", flush=True)
+            
+            # 如果 Compass API 失败，尝试 DeepSeek API（流式）
+            if not ai_call_success and deepseek_api_key:
+                try:
+                    print("🔄 尝试使用 DeepSeek API（流式）...", flush=True)
+                    import httpx
+                    
                     url = f"{deepseek_base_url}/chat/completions"
                     headers = {
                         "Content-Type": "application/json",
                         "Authorization": f"Bearer {deepseek_api_key}"
                     }
+                    
                     payload = {
                         "model": "deepseek-chat",
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "你是一位精通八字命理的大师，请严格按照 JSON 格式返回结果。"
+                                "content": "你是一位精通八字命理的大师，擅长根据八字和大运推演人生运势。请严格按照 JSON 格式返回结果，不要包含任何 markdown 标记。"
                             },
                             {
                                 "role": "user",
@@ -1824,46 +1877,45 @@ async def generate_kline(request: KLineGenerateRequest):
                         ],
                         "temperature": 0.7,
                         "max_tokens": 2000,
-                        "response_format": {"type": "json_object"}
+                        "response_format": {"type": "json_object"},  # 强制 JSON 输出
+                        "stream": True  # 启用流式
                     }
                     
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        response = await client.post(url, json=payload, headers=headers)
-                        response.raise_for_status()
-                        result = response.json()
-                        return result["choices"][0]["message"]["content"]
-                
-                try:
-                    # 增加超时时间到60秒
-                    ai_response = await asyncio.wait_for(call_deepseek(), timeout=60.0)
-                    if ai_response:
+                    # 使用流式调用
+                    with httpx.Client(timeout=60.0) as client:
+                        with client.stream("POST", url, json=payload, headers=headers) as response:
+                            response.raise_for_status()
+                            for line in response.iter_lines():
+                                if line.startswith("data: "):
+                                    data_str = line[6:]  # 移除 "data: " 前缀
+                                    if data_str == "[DONE]":
+                                        break
+                                    try:
+                                        chunk_data = json.loads(data_str)
+                                        if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+                                            delta = chunk_data["choices"][0].get("delta", {})
+                                            chunk_text = delta.get("content", "")
+                                            if chunk_text:
+                                                response_text += chunk_text
+                                                # 流式发送文本片段
+                                                yield f"data: {json.dumps({'type': 'text', 'content': chunk_text}, ensure_ascii=False)}\n\n"
+                                    except json.JSONDecodeError:
+                                        continue
+                    
+                    if response_text:
+                        print(f"✅ DeepSeek API 流式调用成功，返回内容长度: {len(response_text)}", flush=True)
                         ai_call_success = True
-                        print(f"✅ DeepSeek API 调用成功，返回长度: {len(ai_response)}", flush=True)
-                except asyncio.TimeoutError:
-                    print("⏰ DeepSeek API 调用超时（60秒）", flush=True)
-                except Exception as e:
-                    print(f"❌ DeepSeek API 调用失败: {e}", flush=True)
-            except Exception as e:
-                print(f"❌ DeepSeek API 异常: {e}", flush=True)
-        
-        # 流式返回结果（保持兼容性，但使用已获取的AI响应）
-        async def generate_kline_stream():
-            """流式生成K线数据的生成器函数（优化版本）"""
-            # 确保 current_age 在函数内部可访问（从外部作用域获取）
-            nonlocal current_age, ai_response, ai_call_success
-            response_text = ai_response or ""
+                        
+                except Exception as deepseek_error:
+                    print(f"❌ DeepSeek API 调用也失败: {deepseek_error}", flush=True)
+                    import traceback
+                    print(traceback.format_exc(), flush=True)
             
-            # 发送进度：30%（开始处理）
-            yield f"data: {json.dumps({'type': 'progress', 'progress': 30}, ensure_ascii=False)}\n\n"
-            
-            # 如果AI调用失败，使用默认数据
-            if not ai_call_success or not response_text:
-                print("⚠️  AI调用失败，使用默认数据", flush=True)
-                yield f"data: {json.dumps({'type': 'error', 'content': 'AI 服务调用失败，将使用默认数据'}, ensure_ascii=False)}\n\n"
+            # 如果所有 AI 服务都失败，使用默认数据
+            if not ai_call_success:
+                yield f"data: {json.dumps({'type': 'error', 'content': '所有 AI 服务调用失败，将使用默认数据'}, ensure_ascii=False)}\n\n"
+                # 继续处理，使用默认数据
                 response_text = "{}"  # 空JSON，将使用默认数据
-            
-            # 发送进度：70%（AI调用完成）
-            yield f"data: {json.dumps({'type': 'progress', 'progress': 70}, ensure_ascii=False)}\n\n"
             
             # 数据清洗：去除 Markdown 标记
             clean_json = response_text.replace("```json", "").replace("```", "").strip()
@@ -1980,7 +2032,7 @@ async def generate_kline(request: KLineGenerateRequest):
                             "is_current": stage["age_range"][0] <= current_age <= stage["age_range"][1]
                         })
                 
-                # 获取当前年份的详细信息
+                # 获取当前年份的详细信息（需要调用 LLM 生成详细分析）
                 current_year_detail = {
                     "age": current_age,
                     "year": chart_points[current_age]["year"] if current_age < len(chart_points) else birth_year + current_age,
@@ -1988,7 +2040,7 @@ async def generate_kline(request: KLineGenerateRequest):
                     "da_yun": chart_points[current_age]["da_yun"] if current_age < len(chart_points) else "",
                     "score": current_score,
                     "label": current_label,
-                    "wealth": "财运稳健，升职加薪",
+                    "wealth": "财运稳健，升职加薪",  # 默认值，后续可通过 LLM 生成
                     "interpersonal": "贵人提携",
                     "relationship": "感情正式稳定",
                     "health": "防止过劳",
@@ -2048,7 +2100,7 @@ async def generate_kline(request: KLineGenerateRequest):
                 yield "data: [DONE]\n\n"
                 
             except Exception as e:
-                print(f"⚠️  数据处理失败: {e}", flush=True)
+                print(f"⚠️  LLM API 调用失败: {e}", flush=True)
                 import traceback
                 print(traceback.format_exc(), flush=True)
                 
@@ -2058,118 +2110,115 @@ async def generate_kline(request: KLineGenerateRequest):
                 current_year = datetime.now().year
                 current_age = current_year - birth_year
             
-            # 默认数据生成逻辑（如果上面的try块失败）
-            if 'chart_data' not in locals():
-                da_yun = bazi_report.get('da_yun', [])
-                base_score = 60
+            da_yun = bazi_report.get('da_yun', [])
+            base_score = 60
+            
+            # 生成 0-100 岁的默认数据
+            chart_points = []
+            for i, timeline_point in enumerate(timeline_data):
+                age = timeline_point['age']
+                year = timeline_point['year']
+                gan_zhi = timeline_point['gan_zhi']
+                da_yun_name = timeline_point['da_yun']
                 
-                # 生成 0-100 岁的默认数据
-                chart_points = []
-                for i, timeline_point in enumerate(timeline_data):
-                    age = timeline_point['age']
-                    year = timeline_point['year']
-                    gan_zhi = timeline_point['gan_zhi']
-                    da_yun_name = timeline_point['da_yun']
-                    
-                    # 根据大运简单调整分数
-                    score = base_score
-                    for dy in da_yun:
-                        age_start = dy.get('age_start', 0)
-                        age_end = dy.get('age_end', 100)
-                        if age_start <= age < age_end:
-                            score = base_score + 10  # 大运期间分数稍高
-                            break
-                    
-                    chart_points.append({
-                        "age": age,
-                        "year": year,
-                        "gan_zhi": gan_zhi,
-                        "da_yun": da_yun_name,
-                        "score": score,
-                        "is_peak": False,
-                        "is_valley": False
+                # 根据大运简单调整分数
+                score = base_score
+                for dy in da_yun:
+                    age_start = dy.get('age_start', 0)
+                    age_end = dy.get('age_end', 100)
+                    if age_start <= age < age_end:
+                        score = base_score + 10  # 大运期间分数稍高
+                        break
+                
+                chart_points.append({
+                    "age": age,
+                    "year": year,
+                    "gan_zhi": gan_zhi,
+                    "da_yun": da_yun_name,
+                    "score": score,
+                    "is_peak": False,
+                    "is_valley": False
+                })
+            
+            # 计算默认的当前运势信息
+            current_score = base_score
+            current_label = "平"
+            
+            # 计算5年趋势
+            trend_direction = "平稳"
+            trend_value = 0
+            
+            # 计算人生阶段分析
+            stages = [
+                {"name": "童年", "age_range": (0, 12), "scores": [base_score] * 13},
+                {"name": "青年", "age_range": (13, 30), "scores": [base_score] * 18},
+                {"name": "壮年", "age_range": (31, 50), "scores": [base_score] * 20},
+                {"name": "中年", "age_range": (51, 65), "scores": [base_score] * 15},
+                {"name": "老年", "age_range": (66, 100), "scores": [base_score] * 35}
+            ]
+            
+            stage_analysis = []
+            for stage in stages:
+                stage_scores = stage["scores"]
+                if stage_scores:
+                    avg_score = sum(stage_scores) / len(stage_scores)
+                    stage_analysis.append({
+                        "name": stage["name"],
+                        "age_range": f"{stage['age_range'][0]}-{stage['age_range'][1]}岁",
+                        "avg_score": round(avg_score, 1),
+                        "is_current": stage["age_range"][0] <= current_age <= stage["age_range"][1]
                     })
-                
-                # 计算默认的当前运势信息
-                current_score = base_score
-                current_label = "平"
-                
-                # 计算5年趋势
-                trend_direction = "平稳"
-                trend_value = 0
-                
-                # 计算人生阶段分析
-                stages = [
-                    {"name": "童年", "age_range": (0, 12), "scores": [base_score] * 13},
-                    {"name": "青年", "age_range": (13, 30), "scores": [base_score] * 18},
-                    {"name": "壮年", "age_range": (31, 50), "scores": [base_score] * 20},
-                    {"name": "中年", "age_range": (51, 65), "scores": [base_score] * 15},
-                    {"name": "老年", "age_range": (66, 100), "scores": [base_score] * 35}
-                ]
-                
-                stage_analysis = []
-                for stage in stages:
-                    stage_scores = stage["scores"]
-                    if stage_scores:
-                        avg_score = sum(stage_scores) / len(stage_scores)
-                        stage_analysis.append({
-                            "name": stage["name"],
-                            "age_range": f"{stage['age_range'][0]}-{stage['age_range'][1]}岁",
-                            "avg_score": round(avg_score, 1),
-                            "is_current": stage["age_range"][0] <= current_age <= stage["age_range"][1]
-                        })
-                
-                # 获取当前年份的详细信息
-                current_point = chart_points[current_age] if current_age < len(chart_points) else None
-                current_year_detail = {
-                    "age": current_age,
-                    "year": current_point["year"] if current_point else birth_year + current_age,
-                    "gan_zhi": current_point["gan_zhi"] if current_point else "",
-                    "da_yun": current_point["da_yun"] if current_point else "",
+            
+            # 获取当前年份的详细信息
+            current_point = chart_points[current_age] if current_age < len(chart_points) else None
+            current_year_detail = {
+                "age": current_age,
+                "year": current_point["year"] if current_point else birth_year + current_age,
+                "gan_zhi": current_point["gan_zhi"] if current_point else "",
+                "da_yun": current_point["da_yun"] if current_point else "",
+                "score": current_score,
+                "label": current_label,
+                "wealth": "财运一般",
+                "interpersonal": "人际关系平稳",
+                "relationship": "感情稳定",
+                "health": "注意健康",
+                "suitable": "稳步发展",
+                "avoid": "避免冲动"
+            }
+            
+            chart_data = {
+                "points": chart_points,
+                "peaks": [],
+                "valleys": [],
+                "current_age": current_age,
+                "current_fortune": {
                     "score": current_score,
-                    "label": current_label,
-                    "wealth": "财运一般",
-                    "interpersonal": "人际关系平稳",
-                    "relationship": "感情稳定",
-                    "health": "注意健康",
-                    "suitable": "稳步发展",
-                    "avoid": "避免冲动"
-                }
-                
-                chart_data = {
-                    "points": chart_points,
-                    "peaks": [],
-                    "valleys": [],
-                    "current_age": current_age,
-                    "current_fortune": {
-                        "score": current_score,
-                        "label": current_label
-                    },
-                    "trend_5years": {
-                        "direction": trend_direction,
-                        "value": trend_value,
-                        "description": trend_direction
-                    },
-                    "next_peak": None,
-                    "next_valley": None,
-                    "stage_analysis": stage_analysis,
-                    "current_year_detail": current_year_detail
-                }
-                
-                # 生成更友好的分析文本
-                current_stage_name = '中年'
-                if stage_analysis:
-                    for stage in stage_analysis:
-                        if stage.get('is_current'):
-                            current_stage_name = stage['name']
-                            break
-                
-                trend_advice = '保持现状，稳步发展'
-                if trend_direction == '上升':
-                    trend_advice = '把握机会，积极进取'
-                elif trend_direction == '下降':
-                    trend_advice = '谨慎行事，稳中求进'
-                
+                    "label": current_label
+                },
+                "trend_5years": {
+                    "direction": trend_direction,
+                    "value": trend_value,
+                    "description": trend_direction
+                },
+                "next_peak": None,
+                "next_valley": None,
+                "stage_analysis": stage_analysis,
+                "current_year_detail": current_year_detail
+            }
+            # 生成更友好的分析文本
+            current_stage_name = '中年'
+            if stage_analysis:
+                for stage in stage_analysis:
+                    if stage.get('is_current'):
+                        current_stage_name = stage['name']
+                        break
+            
+            trend_advice = '保持现状，稳步发展'
+            if trend_direction == '上升':
+                trend_advice = '把握机会，积极进取'
+            elif trend_direction == '下降':
+                trend_advice = '谨慎行事，稳中求进'
+            
                 stage_text = '\n'.join([f'- {stage["name"]}（{stage["age_range"]}）：平均运势{stage["avg_score"]}分' for stage in stage_analysis])
                 
                 analysis_text = f"""基于您的八字和大运分析，整体运势呈现平稳发展态势。
@@ -2254,6 +2303,27 @@ class LifeLineRequest(BaseModel):
                 datetime(year, month, v)
             except ValueError:
                 raise ValueError(f'日期无效: {year}-{month}-{v}')
+        return v
+
+
+class DivinationRequest(BaseModel):
+    """起卦请求模型"""
+    stage: str = Field(..., description="阶段：greeting（初始接待）、analysis（正式排盘）、dayun（大运推演）")
+    user_input: Optional[str] = Field(None, description="用户输入（生辰信息或'起大运'）")
+    birth_date: Optional[str] = Field(None, description="出生日期 YYYY-MM-DD（阶段2和3需要）")
+    birth_time: Optional[str] = Field(None, description="出生时间 HH:MM（阶段2和3需要）")
+    gender: Optional[str] = Field(None, description="性别（阶段2和3需要）")
+    lat: Optional[float] = Field(None, description="纬度（阶段2和3需要）")
+    lng: Optional[float] = Field(None, description="经度（阶段2和3需要）")
+    city: Optional[str] = Field(None, description="出生地（阶段2和3需要）")
+    name: Optional[str] = Field("有缘人", description="姓名")
+    
+    @field_validator('stage')
+    @classmethod
+    def validate_stage(cls, v):
+        """验证阶段字段"""
+        if v not in ['greeting', 'analysis', 'dayun']:
+            raise ValueError('阶段必须是 greeting、analysis 或 dayun')
         return v
 
 
@@ -3080,3 +3150,255 @@ async def divination(request: DivinationRequest):
         import traceback
         print(traceback.format_exc(), flush=True)
         raise HTTPException(status_code=500, detail=f"起卦功能失败: {str(e)}")
+
+
+class ChatDivinationRequest(BaseModel):
+    """起卦对话请求模型（有状态版本）"""
+    messages: List[Dict[str, str]] = Field(..., description="对话历史记录，格式：[{'role': 'user', 'content': '...'}, {'role': 'assistant', 'content': '...'}, ...]，最后一条必须是用户消息")
+    bazi_data: Optional[Dict] = Field(None, description="八字排盘数据（可选，如果前端已通过表单提交）")
+
+
+@app.post("/api/chat/divination")
+async def chat_divination(request: ChatDivinationRequest):
+    """
+    起卦对话接口
+    
+    处理算命逻辑的对话式接口，支持上下文管理。
+    
+    Args:
+        request: 包含 messages（对话历史）和 user_id（用户ID）
+    
+    Returns:
+        流式返回 AI 回复
+    """
+    if not compass_client:
+        raise HTTPException(
+            status_code=503,
+            detail="AI 服务未配置，请在 .env 文件中设置 COMPASS_API_KEY"
+        )
+    
+    try:
+        # 1. 构建消息列表
+        messages = []
+        
+        # 1.1 添加 System Prompt
+        system_prompt = DIVINATION_SYSTEM_PROMPT
+        
+        # 1.2 八字数据将在构建 prompt 时单独添加，确保模型能清楚看到
+        # 这里先记录，稍后在 conversation_parts 中添加
+        
+        messages.append({
+            "role": "system",
+            "content": system_prompt
+        })
+        
+        # 1.3 添加历史对话记录（前端传来的 messages）
+        # 过滤掉可能的 system 消息，避免重复
+        user_inputs = []
+        assistant_responses = []
+        
+        for msg in request.messages:
+            if isinstance(msg, dict) and msg.get("role") != "system":
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                
+                if role == "user":
+                    user_inputs.append(content)
+                elif role == "assistant":
+                    assistant_responses.append(content)
+                
+                messages.append({
+                    "role": role,
+                    "content": content
+                })
+        
+        # 1.4 状态判定：检测用户是否输入"起大运"
+        # 检查最后一条用户消息是否包含"起大运"
+        last_user_input = user_inputs[-1] if user_inputs else ""
+        is_dayun_request = "起大运" in last_user_input or "大运" in last_user_input
+        
+        if is_dayun_request:
+            # 如果用户要求起大运，添加系统指令跳过排盘和板块分析
+            dayun_instruction = """【重要指令】
+用户已阅读基本分析，现在请跳过【八字排盘】和【基本面分析】板块，直接进入【大运推演】阶段。
+
+请直接开始分析：
+1. 起运原理（为何顺/逆行，几岁起运）
+2. 大运流变（前3-4步大运，重点分析当前大运）
+3. 总结与福报
+
+不要重复输出排盘和基本面分析内容。"""
+            
+            messages.append({
+                "role": "system",
+                "content": dayun_instruction
+            })
+            print(f"🔍 检测到用户要求起大运，已添加跳过指令", flush=True)
+        
+        print(f"📨 收到起卦对话请求，消息数: {len(messages)}, 是否起大运: {is_dayun_request}, 八字数据: {bool(request.bazi_data)}", flush=True)
+        
+        # 2. 调用 LLM（流式输出）
+        try:
+            # 使用 Gemini 2.5 Flash 或 Pro 1.5（支持长文本）
+            model_name = "gemini-2.5-flash"  # 或 "gemini-1.5-pro" 如果需要更长上下文
+            
+            # 转换消息格式为 Gemini API 格式
+            # Gemini API 使用 contents 参数，可以是字符串或消息列表
+            # 我们需要将对话历史转换为 Gemini 格式
+            
+            # 提取 system prompt 和额外指令
+            system_prompt_content = ""
+            additional_instructions = []
+            user_messages = []
+            assistant_messages = []
+            
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                
+                if role == "system":
+                    if content == system_prompt:
+                        system_prompt_content = content
+                    else:
+                        # 这是额外的系统指令（如"起大运"指令）
+                        additional_instructions.append(content)
+                elif role == "user":
+                    user_messages.append(content)
+                elif role == "assistant":
+                    assistant_messages.append(content)
+            
+            # 构建完整的 prompt
+            # 将 system prompt 和对话历史合并
+            conversation_parts = []
+            
+            # 先添加主要的 system prompt
+            if system_prompt_content:
+                conversation_parts.append(system_prompt_content)
+            
+            # 如果有八字数据，明确提示模型使用这些数据
+            if request.bazi_data:
+                bazi_info = f"""
+【用户生辰信息】
+请基于以下实际数据进行精准分析，不要使用通用模板：
+{json.dumps(request.bazi_data, ensure_ascii=False, indent=2)}
+"""
+                conversation_parts.append(bazi_info)
+                print(f"📊 八字数据已添加到 prompt: {json.dumps(request.bazi_data, ensure_ascii=False)[:200]}...", flush=True)
+            
+            # 如果有额外的系统指令（如"起大运"指令），添加到 prompt 中
+            if additional_instructions:
+                conversation_parts.append("\n\n".join(additional_instructions))
+            
+            # 合并用户和助手消息，形成对话历史
+            for i, user_msg in enumerate(user_messages):
+                conversation_parts.append(f"用户：{user_msg}")
+                if i < len(assistant_responses):
+                    conversation_parts.append(f"助手：{assistant_responses[i]}")
+            
+            # 如果有最后一条用户消息，添加它
+            if len(user_messages) > len(assistant_responses):
+                conversation_parts.append(f"用户：{user_messages[-1]}")
+            
+            # 合并为完整 prompt
+            full_prompt = "\n\n".join(conversation_parts)
+            
+            # 调用流式 API
+            # Gemini API 的 generation_config 参数
+            try:
+                # 方法1：使用 config 参数（某些 SDK 版本）
+                from google.genai import types
+                stream = compass_client.models.generate_content_stream(
+                    model=model_name,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.7,
+                        max_output_tokens=8192,
+                    )
+                )
+                print("✅ 使用 types.GenerateContentConfig 设置参数", flush=True)
+            except (TypeError, AttributeError, ImportError) as e1:
+                try:
+                    # 方法2：使用字典格式的 config
+                    stream = compass_client.models.generate_content_stream(
+                        model=model_name,
+                        contents=full_prompt,
+                        config={
+                            "temperature": 0.7,
+                            "max_output_tokens": 8192,
+                        }
+                    )
+                    print("✅ 使用字典格式 config 设置参数", flush=True)
+                except (TypeError, AttributeError) as e2:
+                    try:
+                        # 方法3：直接传递参数
+                        stream = compass_client.models.generate_content_stream(
+                            model=model_name,
+                            contents=full_prompt,
+                            temperature=0.7,
+                            max_output_tokens=8192
+                        )
+                        print("✅ 使用直接参数设置", flush=True)
+                    except (TypeError, AttributeError) as e3:
+                        # 方法4：使用默认参数（temperature 在 prompt 中控制）
+                        print(f"⚠️  参数设置失败，使用默认参数: {e3}", flush=True)
+                        stream = compass_client.models.generate_content_stream(
+                            model=model_name,
+                            contents=full_prompt
+                        )
+            
+            # 3. 流式返回结果
+            async def generate_response():
+                full_text = ""
+                try:
+                    for chunk in stream:
+                        chunk_text = ""
+                        if hasattr(chunk, 'text'):
+                            chunk_text = chunk.text
+                        elif hasattr(chunk, 'candidates') and chunk.candidates:
+                            if hasattr(chunk.candidates[0], 'content'):
+                                if hasattr(chunk.candidates[0].content, 'parts'):
+                                    for part in chunk.candidates[0].content.parts:
+                                        if hasattr(part, 'text'):
+                                            chunk_text += part.text
+                        
+                        if chunk_text:
+                            full_text += chunk_text
+                            yield f"data: {json.dumps({'type': 'text', 'content': chunk_text}, ensure_ascii=False)}\n\n"
+                    
+                    # 发送完成标记
+                    yield "data: [DONE]\n\n"
+                    print(f"✅ 起卦对话完成，总长度: {len(full_text)} 字符", flush=True)
+                    
+                except Exception as e:
+                    print(f"❌ 流式输出错误: {e}", flush=True)
+                    yield f"data: {json.dumps({'type': 'error', 'content': f'生成错误: {str(e)}'}, ensure_ascii=False)}\n\n"
+            
+            return StreamingResponse(
+                generate_response(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+            
+        except Exception as e:
+            print(f"❌ LLM 调用失败: {e}", flush=True)
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"AI 服务调用失败: {str(e)}"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ 起卦对话接口错误: {e}", flush=True)
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"起卦对话失败: {str(e)}"
+        )
