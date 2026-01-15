@@ -22,17 +22,30 @@ export default function KLineResult() {
     // 从 location.state 获取数据
     if (location.state?.klineData) {
       console.log('✅ 从 location.state 获取到 K 线数据:', location.state.klineData);
-      // 注意：后端返回的是 { success: true, data: {...} }
-      // 但 generateKLineChart 已经提取了 data，所以这里直接使用
+      
+      // 验证数据完整性
       const data = location.state.klineData;
+      if (!data || !data.chart_data) {
+        console.error('❌ K线数据不完整，返回上一页');
+        setError('K线数据不完整，请重新生成');
+        setLoading(false);
+        setTimeout(() => {
+          navigate('/kline', { replace: true });
+        }, 2000);
+        return;
+      }
+      
       setKlineData(data);
       setLoading(false);
     } else {
       console.error('❌ 未找到 K 线数据');
       setError('未找到 K 线数据，请重新生成');
       setLoading(false);
+      setTimeout(() => {
+        navigate('/kline', { replace: true });
+      }, 2000);
     }
-  }, [location]);
+  }, [location, navigate]);
 
   // 渲染 ECharts 图表
   useEffect(() => {

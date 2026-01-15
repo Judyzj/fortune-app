@@ -1675,23 +1675,16 @@ async def generate_kline(request: KLineGenerateRequest):
             gender=gender
         )
         
-        # 2. 调用 LLM 获取结构化的命理分析数据（复用现有逻辑）
-        llm_data = await call_llm_for_structured_data(
-            bazi_report,
-            name,
-            gender,
-            city,
-            birth_date,
-            birth_time
-        )
-        
-        # 3. 构建 K 线生成专用的 System Prompt（使用完整的八字数据）
-        # 4. 调用 LLM 生成 K 线解读（必须使用真实八字，不能是 Mock）
-        if not compass_client:
+        # 2. 直接生成 K 线数据（跳过不必要的 call_llm_for_structured_data 调用，提升速度）
+        # 注意：K线生成只需要八字数据，不需要先调用结构化数据接口
+        if not compass_client and not deepseek_api_key:
             raise HTTPException(
                 status_code=500,
-                detail="Compass API 未配置，无法生成 K 线数据"
+                detail="AI API 未配置，无法生成 K 线数据"
             )
+        
+        # 优化：使用非流式API调用，添加超时保护，提高稳定性
+        print(f"📊 开始生成 K 线数据（优化版本，30秒超时）", flush=True)
         
         # 构建精简的 K 线 Prompt（只要求 JSON 输出，提速）
         # 提取关键八字信息
@@ -1760,19 +1753,453 @@ async def generate_kline(request: KLineGenerateRequest):
         # 调用 LLM API（流式，先传输分析文本，最后传输JSON数据）
         print(f"📊 开始调用 LLM 生成 K 线数据（流式模式）", flush=True)
         
-        # 流式返回结果
-        async def generate_kline_stream():
-            """流式生成K线数据的生成器函数"""
-            # 确保 current_age 在函数内部可访问（从外部作用域获取）
-            nonlocal current_age
-            response_text = ""
-            ai_call_success = False
-            
-            # 首先尝试 Compass API（流式）
-            if compass_client:
+        # 优化：使用非流式API调用（更快更稳定），添加30秒超时
+        print(f"📊 开始调用 LLM 生成 K 线数据（非流式模式，30秒超时）", flush=True)
+        
+        import asyncio
+        
+        # 调用AI API（非流式，带超时）
+        ai_response = None
+        ai_call_success = False
+        
+        # 首先尝试 Compass API（非流式）
+        if compass_client:
+            try:
+                print("🔄 调用 Compass API（非流式，30秒超时）...", flush=True)
+                
+                async def call_compass():
+                    response = compass_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=kline_prompt,
+                        config={
+                            "response_mime_type": "application/json",
+                            "temperature": 0.7,
+                            "max_output_tokens": 2000
+                        }
+                    )
+                    if hasattr(response, 'text'):
+                        return response.text
+                    elif hasattr(response, 'candidates') and response.candidates:
+                        if hasattr(response.candidates[0], 'content'):
+                            if hasattr(response.candidates[0].content, 'parts'):
+                                return ''.join([part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')])
+                    return None
+                
                 try:
-                    print("🔄 尝试使用 Compass API（流式）...", flush=True)
-                    stream = None
+                    # 增加超时时间到60秒
+                    ai_response = await asyncio.wait_for(call_compass(), timeout=60.0)
+                    if ai_response:
+                        ai_call_success = True
+                        print(f"✅ Compass API 调用成功，返回长度: {len(ai_response)}", flush=True)
+                except asyncio.TimeoutError:
+                    print("⏰ Compass API 调用超时（60秒）", flush=True)
+                except Exception as e:
+                    print(f"❌ Compass API 调用失败: {e}", flush=True)
+            except Exception as e:
+                print(f"❌ Compass API 异常: {e}", flush=True)
+        
+        # 如果Compass失败，尝试DeepSeek（非流式）
+        if not ai_call_success and deepseek_api_key:
+            try:
+                print("🔄 调用 DeepSeek API（非流式，30秒超时）...", flush=True)
+                import httpx
+                
+                async def call_deepseek():
+                    url = f"{deepseek_base_url}/chat/completions"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {deepseek_api_key}"
+                    }
+                    payload = {
+                        "model": "deepseek-chat",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "你是一位精通八字命理的大师，请严格按照 JSON 格式返回结果。"
+                            },
+                            {
+                                "role": "user",
+                                "content": kline_prompt
+                            }
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 2000,
+                        "response_format": {"type": "json_object"}
+                    }
+                    
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.post(url, json=payload, headers=headers)
+                        response.raise_for_status()
+                        result = response.json()
+                        return result["choices"][0]["message"]["content"]
+                
+                try:
+                    # 增加超时时间到60秒
+                    ai_response = await asyncio.wait_for(call_deepseek(), timeout=60.0)
+                    if ai_response:
+                        ai_call_success = True
+                        print(f"✅ DeepSeek API 调用成功，返回长度: {len(ai_response)}", flush=True)
+                except asyncio.TimeoutError:
+                    print("⏰ DeepSeek API 调用超时（60秒）", flush=True)
+                except Exception as e:
+                    print(f"❌ DeepSeek API 调用失败: {e}", flush=True)
+            except Exception as e:
+                print(f"❌ DeepSeek API 异常: {e}", flush=True)
+        
+        # 流式返回结果（保持兼容性，但使用已获取的AI响应）
+        async def generate_kline_stream():
+            """流式生成K线数据的生成器函数（优化版本）"""
+            # 确保 current_age 在函数内部可访问（从外部作用域获取）
+            nonlocal current_age, ai_response, ai_call_success
+            response_text = ai_response or ""
+            
+            # 发送进度：30%（开始处理）
+            yield f"data: {json.dumps({'type': 'progress', 'progress': 30}, ensure_ascii=False)}\n\n"
+            
+            # 如果AI调用失败，使用默认数据
+            if not ai_call_success or not response_text:
+                print("⚠️  AI调用失败，使用默认数据", flush=True)
+                yield f"data: {json.dumps({'type': 'error', 'content': 'AI 服务调用失败，将使用默认数据'}, ensure_ascii=False)}\n\n"
+                response_text = "{}"  # 空JSON，将使用默认数据
+            
+            # 发送进度：70%（AI调用完成）
+            yield f"data: {json.dumps({'type': 'progress', 'progress': 70}, ensure_ascii=False)}\n\n"
+            
+            # 数据清洗：去除 Markdown 标记
+            clean_json = response_text.replace("```json", "").replace("```", "").strip()
+            
+            try:
+                # 尝试解析 JSON
+                try:
+                    data = json.loads(clean_json)
+                    print("✅ JSON 解析成功", flush=True)
+                except json.JSONDecodeError as e:
+                    print(f"❌ JSON 解析失败: {e}", flush=True)
+                    print(f"❌ 清洗后的内容（前500字符）: {clean_json[:500]}", flush=True)
+                    # 如果解析失败，尝试提取 JSON 对象
+                    import re
+                    json_match = re.search(r'\{.*\}', clean_json, re.DOTALL)
+                    if json_match:
+                        try:
+                            data = json.loads(json_match.group(0))
+                            print("✅ 从文本中提取 JSON 成功", flush=True)
+                        except json.JSONDecodeError:
+                            data = None
+                    else:
+                        data = None
+                
+                # 如果解析失败，使用默认数据
+                if not data:
+                    raise ValueError("无法解析 JSON，将使用默认数据")
+                
+                # 提取数据
+                scores = data.get("scores", [])
+                peaks = data.get("peaks", [])
+                valleys = data.get("valleys", [])
+                analysis_text = data.get("summary", "基于八字和大运分析，整体运势平稳发展。")
+                
+                # 验证数组长度（必须是101个）
+                if len(scores) != 101:
+                    print(f"⚠️  数组长度不正确: scores={len(scores)}，期望101个", flush=True)
+                    # 填充或截取到101个
+                    if len(scores) < 101:
+                        scores.extend([60] * (101 - len(scores)))
+                    elif len(scores) > 101:
+                        scores[:] = scores[:101]
+                
+                # 验证高峰和低谷数据
+                peaks = [p for p in peaks if isinstance(p, dict) and 'age' in p and 0 <= p['age'] <= 100]
+                valleys = [v for v in valleys if isinstance(v, dict) and 'age' in v and 0 <= v['age'] <= 100]
+                
+                # 生成年份数组和详细信息（0-100岁，共101年）
+                chart_points = []
+                for i, timeline_point in enumerate(timeline_data):
+                    age = timeline_point['age']
+                    year = timeline_point['year']
+                    gan_zhi = timeline_point['gan_zhi']
+                    da_yun = timeline_point['da_yun']
+                    score = scores[i] if i < len(scores) else 60
+                    
+                    # 检查是否是高峰或低谷
+                    is_peak = any(p.get('age') == age for p in peaks)
+                    is_valley = any(v.get('age') == age for v in valleys)
+                    
+                    chart_points.append({
+                        "age": age,
+                        "year": year,
+                        "gan_zhi": gan_zhi,
+                        "da_yun": da_yun,
+                        "score": score,
+                        "is_peak": is_peak,
+                        "is_valley": is_valley
+                    })
+                
+                # 计算当前运势信息
+                current_score = scores[current_age] if current_age < len(scores) else 60
+                current_label = "吉" if current_score >= 70 else ("平" if current_score >= 50 else "凶")
+                
+                # 计算5年趋势（未来5年的平均分 vs 过去5年的平均分）
+                future_ages = [current_age + i for i in range(1, 6) if current_age + i < 101]
+                past_ages = [current_age - i for i in range(1, 6) if current_age - i >= 0]
+                
+                future_avg = sum(scores[age] for age in future_ages) / len(future_ages) if future_ages else current_score
+                past_avg = sum(scores[age] for age in past_ages) / len(past_ages) if past_ages else current_score
+                trend_value = future_avg - past_avg
+                trend_direction = "上升" if trend_value > 5 else ("下降" if trend_value < -5 else "平稳")
+                
+                # 找到下一个高峰和下一个低谷
+                next_peak = None
+                next_valley = None
+                for peak in sorted(peaks, key=lambda x: x.get('age', 0)):
+                    if peak.get('age', 0) > current_age:
+                        next_peak = peak
+                        break
+                for valley in sorted(valleys, key=lambda x: x.get('age', 0)):
+                    if valley.get('age', 0) > current_age:
+                        next_valley = valley
+                        break
+                
+                # 计算人生阶段分析
+                stages = [
+                    {"name": "童年", "age_range": (0, 12), "scores": scores[0:13]},
+                    {"name": "青年", "age_range": (13, 30), "scores": scores[13:31]},
+                    {"name": "壮年", "age_range": (31, 50), "scores": scores[31:51]},
+                    {"name": "中年", "age_range": (51, 65), "scores": scores[51:66]},
+                    {"name": "老年", "age_range": (66, 100), "scores": scores[66:101]}
+                ]
+                
+                stage_analysis = []
+                for stage in stages:
+                    stage_scores = stage["scores"]
+                    if stage_scores:
+                        avg_score = sum(stage_scores) / len(stage_scores)
+                        stage_analysis.append({
+                            "name": stage["name"],
+                            "age_range": f"{stage['age_range'][0]}-{stage['age_range'][1]}岁",
+                            "avg_score": round(avg_score, 1),
+                            "is_current": stage["age_range"][0] <= current_age <= stage["age_range"][1]
+                        })
+                
+                # 获取当前年份的详细信息
+                current_year_detail = {
+                    "age": current_age,
+                    "year": chart_points[current_age]["year"] if current_age < len(chart_points) else birth_year + current_age,
+                    "gan_zhi": chart_points[current_age]["gan_zhi"] if current_age < len(chart_points) else "",
+                    "da_yun": chart_points[current_age]["da_yun"] if current_age < len(chart_points) else "",
+                    "score": current_score,
+                    "label": current_label,
+                    "wealth": "财运稳健，升职加薪",
+                    "interpersonal": "贵人提携",
+                    "relationship": "感情正式稳定",
+                    "health": "防止过劳",
+                    "suitable": "晋升加薪",
+                    "avoid": "背后议论"
+                }
+                
+                # 构建返回数据
+                chart_data = {
+                    "points": chart_points,  # 101个数据点，包含详细信息
+                    "peaks": peaks,  # 高峰列表
+                    "valleys": valleys,  # 低谷列表
+                    "current_age": current_age,  # 当前年龄
+                    "current_fortune": {  # 当前运势信息
+                        "score": current_score,
+                        "label": current_label
+                    },
+                    "trend_5years": {  # 5年趋势
+                        "direction": trend_direction,
+                        "value": round(trend_value, 1),
+                        "description": f"{trend_direction}" + (f"（{abs(round(trend_value, 1))}分）" if abs(trend_value) > 5 else "")
+                    },
+                    "next_peak": {  # 下个高峰
+                        "age": next_peak.get('age') if next_peak else None,
+                        "years_left": next_peak.get('age') - current_age if next_peak else None,
+                        "score": next_peak.get('score') if next_peak else None,
+                        "reason": next_peak.get('reason') if next_peak else None
+                    } if next_peak else None,
+                    "next_valley": {  # 需注意时期
+                        "age": next_valley.get('age') if next_valley else None,
+                        "years_left": next_valley.get('age') - current_age if next_valley else None,
+                        "score": next_valley.get('score') if next_valley else None,
+                        "reason": next_valley.get('reason') if next_valley else None
+                    } if next_valley else None,
+                    "stage_analysis": stage_analysis,  # 人生阶段分析
+                    "current_year_detail": current_year_detail  # 当前年份详细信息
+                }
+                
+                print(f"✅ K 线数据生成成功: 共{len(chart_points)}个数据点，{len(peaks)}个高峰，{len(valleys)}个低谷", flush=True)
+                print(f"✅ 当前运势: {current_score}分 ({current_label}), 5年趋势: {trend_direction}", flush=True)
+                
+                # 发送进度：95%（数据生成完成）
+                yield f"data: {json.dumps({'type': 'progress', 'progress': 95}, ensure_ascii=False)}\n\n"
+                
+                # 流式发送分析文本
+                if analysis_text:
+                    yield f"data: {json.dumps({'type': 'analysis', 'content': analysis_text}, ensure_ascii=False)}\n\n"
+                
+                # 流式发送完整的图表数据
+                yield f"data: {json.dumps({'type': 'chart_data', 'data': chart_data}, ensure_ascii=False)}\n\n"
+                
+                # 发送进度：100%（完成）
+                yield f"data: {json.dumps({'type': 'progress', 'progress': 100}, ensure_ascii=False)}\n\n"
+                
+                # 发送完成标记
+                yield f"data: {json.dumps({'type': 'complete', 'data': {'chart_data': chart_data, 'analysis_text': analysis_text, 'bazi_report': bazi_report}}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                
+            except Exception as e:
+                print(f"⚠️  数据处理失败: {e}", flush=True)
+                import traceback
+                print(traceback.format_exc(), flush=True)
+                
+                # 生成默认数据（兜底）
+                print(f"⚠️  使用默认数据（基于大运）", flush=True)
+                birth_year = datetime.strptime(birth_date, "%Y-%m-%d").year
+                current_year = datetime.now().year
+                current_age = current_year - birth_year
+            
+            # 默认数据生成逻辑（如果上面的try块失败）
+            if 'chart_data' not in locals():
+                da_yun = bazi_report.get('da_yun', [])
+                base_score = 60
+                
+                # 生成 0-100 岁的默认数据
+                chart_points = []
+                for i, timeline_point in enumerate(timeline_data):
+                    age = timeline_point['age']
+                    year = timeline_point['year']
+                    gan_zhi = timeline_point['gan_zhi']
+                    da_yun_name = timeline_point['da_yun']
+                    
+                    # 根据大运简单调整分数
+                    score = base_score
+                    for dy in da_yun:
+                        age_start = dy.get('age_start', 0)
+                        age_end = dy.get('age_end', 100)
+                        if age_start <= age < age_end:
+                            score = base_score + 10  # 大运期间分数稍高
+                            break
+                    
+                    chart_points.append({
+                        "age": age,
+                        "year": year,
+                        "gan_zhi": gan_zhi,
+                        "da_yun": da_yun_name,
+                        "score": score,
+                        "is_peak": False,
+                        "is_valley": False
+                    })
+                
+                # 计算默认的当前运势信息
+                current_score = base_score
+                current_label = "平"
+                
+                # 计算5年趋势
+                trend_direction = "平稳"
+                trend_value = 0
+                
+                # 计算人生阶段分析
+                stages = [
+                    {"name": "童年", "age_range": (0, 12), "scores": [base_score] * 13},
+                    {"name": "青年", "age_range": (13, 30), "scores": [base_score] * 18},
+                    {"name": "壮年", "age_range": (31, 50), "scores": [base_score] * 20},
+                    {"name": "中年", "age_range": (51, 65), "scores": [base_score] * 15},
+                    {"name": "老年", "age_range": (66, 100), "scores": [base_score] * 35}
+                ]
+                
+                stage_analysis = []
+                for stage in stages:
+                    stage_scores = stage["scores"]
+                    if stage_scores:
+                        avg_score = sum(stage_scores) / len(stage_scores)
+                        stage_analysis.append({
+                            "name": stage["name"],
+                            "age_range": f"{stage['age_range'][0]}-{stage['age_range'][1]}岁",
+                            "avg_score": round(avg_score, 1),
+                            "is_current": stage["age_range"][0] <= current_age <= stage["age_range"][1]
+                        })
+                
+                # 获取当前年份的详细信息
+                current_point = chart_points[current_age] if current_age < len(chart_points) else None
+                current_year_detail = {
+                    "age": current_age,
+                    "year": current_point["year"] if current_point else birth_year + current_age,
+                    "gan_zhi": current_point["gan_zhi"] if current_point else "",
+                    "da_yun": current_point["da_yun"] if current_point else "",
+                    "score": current_score,
+                    "label": current_label,
+                    "wealth": "财运一般",
+                    "interpersonal": "人际关系平稳",
+                    "relationship": "感情稳定",
+                    "health": "注意健康",
+                    "suitable": "稳步发展",
+                    "avoid": "避免冲动"
+                }
+                
+                chart_data = {
+                    "points": chart_points,
+                    "peaks": [],
+                    "valleys": [],
+                    "current_age": current_age,
+                    "current_fortune": {
+                        "score": current_score,
+                        "label": current_label
+                    },
+                    "trend_5years": {
+                        "direction": trend_direction,
+                        "value": trend_value,
+                        "description": trend_direction
+                    },
+                    "next_peak": None,
+                    "next_valley": None,
+                    "stage_analysis": stage_analysis,
+                    "current_year_detail": current_year_detail
+                }
+                
+                # 生成更友好的分析文本
+                current_stage_name = '中年'
+                if stage_analysis:
+                    for stage in stage_analysis:
+                        if stage.get('is_current'):
+                            current_stage_name = stage['name']
+                            break
+                
+                trend_advice = '保持现状，稳步发展'
+                if trend_direction == '上升':
+                    trend_advice = '把握机会，积极进取'
+                elif trend_direction == '下降':
+                    trend_advice = '谨慎行事，稳中求进'
+                
+                stage_text = '\n'.join([f'- {stage["name"]}（{stage["age_range"]}）：平均运势{stage["avg_score"]}分' for stage in stage_analysis])
+                
+                analysis_text = f"""基于您的八字和大运分析，整体运势呈现平稳发展态势。
+
+**当前运势（{current_age}岁）**：
+当前处于{current_stage_name}阶段，运势{current_label}，分数为{current_score}分。
+
+**5年趋势**：
+未来5年运势{trend_direction}，建议{trend_advice}。
+
+**人生阶段分析**：
+{stage_text}
+
+**建议**：
+请根据个人实际情况调整人生规划，在运势较好的年份把握机会，在运势较弱的年份谨慎行事，注意健康和安全。
+
+*注：当前数据基于大运推算，如需更详细的分析，请联系专业命理师。*"""
+                
+                # 流式发送分析文本
+                if analysis_text:
+                    yield f"data: {json.dumps({'type': 'analysis', 'content': analysis_text}, ensure_ascii=False)}\n\n"
+                
+                # 流式发送完整的图表数据
+                yield f"data: {json.dumps({'type': 'chart_data', 'data': chart_data}, ensure_ascii=False)}\n\n"
+                
+                # 发送完成标记
+                yield f"data: {json.dumps({'type': 'complete', 'data': {'chart_data': chart_data, 'analysis_text': analysis_text, 'bazi_report': bazi_report}}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+        
+        # 返回流式响应
                     try:
                         # 使用流式API
                         stream = compass_client.models.generate_content_stream(

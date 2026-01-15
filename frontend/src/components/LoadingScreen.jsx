@@ -5,7 +5,7 @@ import { useState, useEffect } from 'react';
  * 玄学风格的加载界面
  * 带有环形进度条（不显示数字）
  */
-export default function LoadingScreen({ progress: externalProgress = null }) {
+export default function LoadingScreen({ progress: externalProgress = null, message = null }) {
   const [progress, setProgress] = useState(0);
 
   // 如果外部传入进度，使用外部进度；否则使用模拟进度
@@ -152,10 +152,10 @@ export default function LoadingScreen({ progress: externalProgress = null }) {
         animate="animate"
       >
         <h2 className="text-2xl font-bold text-gray-900">
-          正在批命...
+          {message ? '正在生成人生K线图...' : '正在批命...'}
         </h2>
         <p className="text-gray-600 text-lg">
-          为您排盘计算中，请稍候
+          {message || '为您排盘计算中，请稍候'}
         </p>
       </motion.div>
 

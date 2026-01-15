@@ -5,6 +5,7 @@
 import os
 import json
 import re
+import asyncio
 import httpx
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
@@ -231,17 +232,32 @@ class LifeLineService:
             "max_tokens": 2000
         }
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
-            
-            # 提取回复内容
-            content = result["choices"][0]["message"]["content"]
-            print(f"📥 AI 返回原始内容长度: {len(content)}", flush=True)
-            
-            # 使用清洗函数解析 JSON
-            return self._clean_ai_response(content)
+        # 重试机制：最多重试2次
+        max_retries = 2
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # 增加超时时间到60秒
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    result = response.json()
+                    
+                    # 提取回复内容
+                    content = result["choices"][0]["message"]["content"]
+                    print(f"📥 AI 返回原始内容长度: {len(content)}", flush=True)
+                    
+                    # 使用清洗函数解析 JSON
+                    return self._clean_ai_response(content)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    print(f"⚠️  DeepSeek API 调用失败（尝试 {attempt + 1}/{max_retries + 1}），1秒后重试...", flush=True)
+                    await asyncio.sleep(1)
+                else:
+                    print(f"❌ DeepSeek API 调用失败（已重试 {max_retries} 次）: {e}", flush=True)
+                    raise
     
     def _merge_data(
         self,
@@ -388,8 +404,10 @@ class LifeLineService:
         birth_year = datetime.strptime(birth_date, "%Y-%m-%d").year
         chart_data = self._merge_data(timeline, ai_response, birth_year)
         
-        # 计算当前分数（假设当前年龄为 30 岁，实际应该根据当前日期计算）
-        current_age = 30  # 可以改为根据当前日期计算
+        # 计算当前分数（根据实际出生日期计算当前年龄）
+        birth_year = datetime.strptime(birth_date, "%Y-%m-%d").year
+        current_year = datetime.now().year
+        current_age = min(current_year - birth_year, 100)  # 限制在0-100岁之间
         current_score = chart_data[current_age].score if current_age < len(chart_data) else 60
         
         # 计算趋势（简单判断：最近 5 年的平均分数趋势）

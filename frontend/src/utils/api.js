@@ -282,19 +282,43 @@ export async function getMyFortuneBooks() {
  * @returns {Promise<Object>} 返回K线图数据
  */
 export async function generateKLineChart(payload, onProgress = null) {
-  try {
-    const response = await fetch(GENERATE_KLINE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
+  // 重试机制：最多重试2次
+  const maxRetries = 2;
+  let lastError = null;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        console.log(`🔄 重试第 ${attempt} 次...`);
+        if (onProgress) {
+          onProgress(10); // 重试时显示10%进度
+        }
+        // 等待一段时间再重试（指数退避）
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+      
+      // 添加60秒超时（增加超时时间）
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
+    
+    try {
+      const response = await fetch(GENERATE_KLINE_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal, // 添加超时控制
+      });
+      
+      clearTimeout(timeoutId);
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-    }
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const error = new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
 
     // 检查是否是流式响应
     const contentType = response.headers.get('content-type');
