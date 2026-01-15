@@ -69,17 +69,11 @@ export default function Result() {
       setLoading(true);
       setError(null);
 
-      // 调用API获取命书详情（添加用户身份信息）
-      const { getAuthHeader, addUserIdToUrl } = await import('../utils/userAuth');
-      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
-      const authHeader = getAuthHeader();
-      const url = addUserIdToUrl(`${API_BASE_URL}/api/fortune-books/${bookId}`);
-      
-      const response = await fetch(url, {
+      // 调用API获取命书详情
+      const response = await fetch(`http://localhost:8000/api/fortune-books/${bookId}`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
-          ...authHeader,
         },
       });
 

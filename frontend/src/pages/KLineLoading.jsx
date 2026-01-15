@@ -36,13 +36,7 @@ export default function KLineLoading() {
         
         console.log('✅ API 调用成功，返回数据:', result);
 
-        // 验证数据完整性
-        if (!result || !result.chart_data) {
-          throw new Error('生成的数据不完整，请重试');
-        }
-        
         // 跳转到结果页面，传递生成的数据
-        // 使用replace: false确保可以返回
         navigate('/kline-result', {
           state: {
             klineData: result,
@@ -54,16 +48,9 @@ export default function KLineLoading() {
         console.log('✅ 已跳转到结果页面');
       } catch (err) {
         console.error('❌ 生成K线图失败:', err);
-        const errorMessage = err.message || '生成K线图失败，请稍后重试';
-        setError(errorMessage);
-        
-        // 确保错误信息被保存，然后跳转
+        setError(err.message || '生成K线图失败，请稍后重试');
         setTimeout(() => {
-          // 使用replace确保能正确跳转
-          navigate('/kline', { 
-            state: { error: errorMessage },
-            replace: true 
-          });
+          navigate('/kline', { state: { error: err.message } });
         }, 3000);
       }
     };
@@ -96,10 +83,5 @@ export default function KLineLoading() {
     );
   }
 
-  return (
-    <LoadingScreen 
-      progress={progress} 
-      message="正在生成人生K线图，这可能需要30-60秒，请耐心等待..."
-    />
-  );
+  return <LoadingScreen progress={progress} />;
 }

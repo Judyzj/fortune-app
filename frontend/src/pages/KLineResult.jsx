@@ -3,7 +3,6 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { ArrowLeft, TrendingUp } from 'lucide-react';
 import * as echarts from 'echarts';
 import LoadingScreen from '../components/LoadingScreen';
-import YearDetailCard from '../components/LifeLine/YearDetailCard';
 
 /**
  * K 线图结果页面
@@ -18,49 +17,22 @@ export default function KLineResult() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [klineData, setKlineData] = useState(null);
-  const [selectedYearData, setSelectedYearData] = useState(null);
 
   useEffect(() => {
     // 从 location.state 获取数据
     if (location.state?.klineData) {
       console.log('✅ 从 location.state 获取到 K 线数据:', location.state.klineData);
-      
-      // 验证数据完整性
+      // 注意：后端返回的是 { success: true, data: {...} }
+      // 但 generateKLineChart 已经提取了 data，所以这里直接使用
       const data = location.state.klineData;
-      if (!data || !data.chart_data) {
-        console.error('❌ K线数据不完整，返回上一页');
-        setError('K线数据不完整，请重新生成');
-        setLoading(false);
-        setTimeout(() => {
-          navigate('/kline', { replace: true });
-        }, 2000);
-        return;
-      }
-      
       setKlineData(data);
-      
-      // 设置默认选中的年份（当前年龄）
-      if (data.chart_data && data.chart_data.points) {
-        const currentAge = data.chart_data.current_age || 0;
-        const currentPoint = data.chart_data.points[currentAge];
-        if (currentPoint) {
-          setSelectedYearData(currentPoint);
-        } else if (data.chart_data.points.length > 0) {
-          // 如果找不到当前年龄，选择第一个
-          setSelectedYearData(data.chart_data.points[0]);
-        }
-      }
-      
       setLoading(false);
     } else {
       console.error('❌ 未找到 K 线数据');
       setError('未找到 K 线数据，请重新生成');
       setLoading(false);
-      setTimeout(() => {
-        navigate('/kline', { replace: true });
-      }, 2000);
     }
-  }, [location, navigate]);
+  }, [location]);
 
   // 渲染 ECharts 图表
   useEffect(() => {
@@ -172,56 +144,6 @@ export default function KLineResult() {
       }
     }] : [];
 
-    // 处理图表点击事件
-    const handleChartClick = (params) => {
-      console.log('📌 图表点击事件:', params);
-      if (params && params.dataIndex !== undefined) {
-        const clickedPoint = points[params.dataIndex];
-        if (clickedPoint) {
-          console.log('📌 点击了年龄:', clickedPoint.age, '数据:', clickedPoint);
-          setSelectedYearData(clickedPoint);
-          // 滚动到详情卡片
-          setTimeout(() => {
-            const detailCard = document.querySelector('[data-year-detail-card]');
-            if (detailCard) {
-              detailCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-            }
-          }, 100);
-        }
-      } else if (params && params.value !== undefined) {
-        // 如果点击的是标记点，尝试从坐标获取年龄
-        const clickedAge = Math.round(params.value[0] || params.coord?.[0] || 0);
-        const clickedPoint = points.find(p => p.age === clickedAge) || points[clickedAge];
-        if (clickedPoint) {
-          console.log('📌 点击了标记点，年龄:', clickedPoint.age);
-          setSelectedYearData(clickedPoint);
-          setTimeout(() => {
-            const detailCard = document.querySelector('[data-year-detail-card]');
-            if (detailCard) {
-              detailCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-            }
-          }, 100);
-        }
-      }
-    };
-
-    // 处理图表悬停事件（鼠标移动时更新选中数据）
-    const handleChartMouseMove = (params) => {
-      if (params && params.dataIndex !== undefined) {
-        const hoveredPoint = points[params.dataIndex];
-        if (hoveredPoint) {
-          setSelectedYearData(hoveredPoint);
-        }
-      } else if (params && params.value !== undefined) {
-        // 如果悬停的是标记点，尝试从坐标获取年龄
-        const hoveredAge = Math.round(params.value[0] || params.coord?.[0] || 0);
-        const hoveredPoint = points.find(p => p.age === hoveredAge) || points[hoveredAge];
-        if (hoveredPoint) {
-          setSelectedYearData(hoveredPoint);
-        }
-      }
-    };
-
     const option = {
       tooltip: {
         trigger: 'axis',
@@ -239,7 +161,6 @@ export default function KLineResult() {
           result += `流年: ${point?.gan_zhi || ''}<br/>`;
           result += `大运: ${point?.da_yun || ''}<br/>`;
           result += `运势: <strong>${params[0].value}分</strong><br/>`;
-          result += '<div style="margin-top: 4px; font-size: 11px; color: #666;">点击查看详情</div>';
           result += '</div>';
           return result;
         }
@@ -365,11 +286,6 @@ export default function KLineResult() {
 
     myChart.setOption(option);
 
-    // 绑定点击事件
-    myChart.on('click', handleChartClick);
-    // 绑定鼠标移动事件（实时更新选中数据）
-    myChart.on('mousemove', handleChartMouseMove);
-
     // 响应式调整
     const handleResize = () => {
       myChart.resize();
@@ -378,9 +294,6 @@ export default function KLineResult() {
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      // 移除事件监听
-      myChart.off('click', handleChartClick);
-      myChart.off('mousemove', handleChartMouseMove);
       if (chartInstanceRef.current) {
         chartInstanceRef.current.dispose();
         chartInstanceRef.current = null;
@@ -517,16 +430,8 @@ export default function KLineResult() {
           ></div>
           
           <div className="mt-4 text-xs text-gray-500 text-center">
-            拖拽滑动查看，点击或悬停查看详情
+            拖拽滑动查看，点击查看详情
           </div>
-        </div>
-
-        {/* 年份详情卡片 */}
-        <div data-year-detail-card>
-          <YearDetailCard 
-            selectedData={selectedYearData} 
-            currentAge={chartData.current_age || 0}
-          />
         </div>
 
         {/* 高峰和低谷列表 */}
@@ -539,33 +444,15 @@ export default function KLineResult() {
                 <span className="text-xs text-gray-500">点击查看</span>
               </div>
               <div className="space-y-3">
-                {peaks.map((peak, index) => {
-                  const peakPoint = points[peak.age];
-                  return (
-                    <div 
-                      key={index} 
-                      className="flex items-center justify-between p-3 bg-green-50 rounded-lg cursor-pointer hover:bg-green-100 transition-colors"
-                      onClick={() => {
-                        if (peakPoint) {
-                          setSelectedYearData(peakPoint);
-                          // 滚动到详情卡片
-                          setTimeout(() => {
-                            const detailCard = document.querySelector('[data-year-detail-card]');
-                            if (detailCard) {
-                              detailCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                            }
-                          }, 100);
-                        }
-                      }}
-                    >
-                      <div>
-                        <div className="font-medium text-gray-900">{peak.age}岁</div>
-                        <div className="text-xs text-gray-600">{peak.reason || '运势高峰'}</div>
-                      </div>
-                      <div className="text-lg font-bold text-green-600">{peak.score || 0}分</div>
+                {peaks.map((peak, index) => (
+                  <div key={index} className="flex items-center justify-between p-3 bg-green-50 rounded-lg">
+                    <div>
+                      <div className="font-medium text-gray-900">{peak.age}岁</div>
+                      <div className="text-xs text-gray-600">{peak.reason || '运势高峰'}</div>
                     </div>
-                  );
-                })}
+                    <div className="text-lg font-bold text-green-600">{peak.score || 0}分</div>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -578,33 +465,15 @@ export default function KLineResult() {
                 <span className="text-xs text-gray-500">点击查看</span>
               </div>
               <div className="space-y-3">
-                {valleys.map((valley, index) => {
-                  const valleyPoint = points[valley.age];
-                  return (
-                    <div 
-                      key={index} 
-                      className="flex items-center justify-between p-3 bg-red-50 rounded-lg cursor-pointer hover:bg-red-100 transition-colors"
-                      onClick={() => {
-                        if (valleyPoint) {
-                          setSelectedYearData(valleyPoint);
-                          // 滚动到详情卡片
-                          setTimeout(() => {
-                            const detailCard = document.querySelector('[data-year-detail-card]');
-                            if (detailCard) {
-                              detailCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                            }
-                          }, 100);
-                        }
-                      }}
-                    >
-                      <div>
-                        <div className="font-medium text-gray-900">{valley.age}岁</div>
-                        <div className="text-xs text-gray-600">{valley.reason || '需谨慎'}</div>
-                      </div>
-                      <div className="text-lg font-bold text-red-600">{valley.score || 0}分</div>
+                {valleys.map((valley, index) => (
+                  <div key={index} className="flex items-center justify-between p-3 bg-red-50 rounded-lg">
+                    <div>
+                      <div className="font-medium text-gray-900">{valley.age}岁</div>
+                      <div className="text-xs text-gray-600">{valley.reason || '需谨慎'}</div>
                     </div>
-                  );
-                })}
+                    <div className="text-lg font-bold text-red-600">{valley.score || 0}分</div>
+                  </div>
+                ))}
               </div>
             </div>
           )}

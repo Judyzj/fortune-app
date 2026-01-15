@@ -2,8 +2,6 @@
  * API 工具函数
  */
 
-import { getAuthHeader, addUserIdToUrl } from './userAuth';
-
 // 支持环境变量，生产环境使用 Vercel 环境变量，开发环境使用 localhost
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const FORTUNE_API = `${API_BASE_URL}/api/fortune`;
@@ -241,15 +239,10 @@ export async function fetchBaziCalculation(formData) {
  */
 export async function getMyFortuneBooks() {
   try {
-    // 添加用户身份信息
-    const authHeader = getAuthHeader();
-    const url = addUserIdToUrl(MY_FORTUNE_BOOKS_API);
-    
-    const response = await fetch(url, {
+    const response = await fetch(MY_FORTUNE_BOOKS_API, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeader,
       },
     });
 
@@ -282,107 +275,68 @@ export async function getMyFortuneBooks() {
  * @returns {Promise<Object>} 返回K线图数据
  */
 export async function generateKLineChart(payload, onProgress = null) {
-  // 重试机制：最多重试2次
-  const maxRetries = 2;
-  let lastError = null;
-  
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      if (attempt > 0) {
-        console.log(`🔄 重试第 ${attempt} 次...`);
-        if (onProgress) {
-          onProgress(10); // 重试时显示10%进度
-        }
-        // 等待一段时间再重试（指数退避）
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-      }
-      
-      // 添加60秒超时（增加超时时间）
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
-      
-      try {
-        const response = await fetch(GENERATE_KLINE_API, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal, // 添加超时控制
-        });
-        
-        clearTimeout(timeoutId);
+  try {
+    const response = await fetch(GENERATE_KLINE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
 
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const error = new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-          error.status = response.status;
-          throw error;
-        }
-
-        // 检查是否是流式响应
-        const contentType = response.headers.get('content-type');
-        if (contentType && contentType.includes('text/event-stream')) {
-          // 流式响应处理
-          let chartData = null;
-          let analysisText = '';
-          
-          await handleSSEStream(response, {
-            onProgress: (progress) => {
-              if (onProgress) {
-                onProgress(progress);
-              }
-            },
-            onChartData: (data) => {
-              chartData = data;
-            },
-            onComplete: (data) => {
-              if (data && data.chart_data) {
-                chartData = data.chart_data;
-                analysisText = data.analysis_text || '';
-              }
-            },
-            onError: (error) => {
-              throw new Error(error);
-            }
-          });
-          
-          if (!chartData) {
-            throw new Error('未收到K线图数据');
-          }
-          
-          return {
-            chart_data: chartData,
-            analysis_text: analysisText
-          };
-        } else {
-          // 普通JSON响应（兼容旧版本）
-          const result = await response.json();
-          
-          if (!result.success) {
-            throw new Error(result.error || '生成K线图失败');
-          }
-
-          return result.data;
-        }
-      } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
-      }
-    } catch (error) {
-      lastError = error;
-      console.error(`❌ 尝试 ${attempt + 1}/${maxRetries + 1} 失败:`, error);
-      
-      // 如果是最后一次尝试，或者错误不可重试，直接抛出
-      if (attempt === maxRetries || error.status === 400 || error.status === 404) {
-        throw new Error(error.message || '生成K线图失败，请稍后重试');
-      }
-      // 继续重试
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
     }
+
+    // 检查是否是流式响应
+    const contentType = response.headers.get('content-type');
+    if (contentType && contentType.includes('text/event-stream')) {
+      // 流式响应处理
+      let chartData = null;
+      let analysisText = '';
+      
+      await handleSSEStream(response, {
+        onProgress: (progress) => {
+          if (onProgress) {
+            onProgress(progress);
+          }
+        },
+        onChartData: (data) => {
+          chartData = data;
+        },
+        onComplete: (data) => {
+          if (data && data.chart_data) {
+            chartData = data.chart_data;
+            analysisText = data.analysis_text || '';
+          }
+        },
+        onError: (error) => {
+          throw new Error(error);
+        }
+      });
+      
+      if (!chartData) {
+        throw new Error('未收到K线图数据');
+      }
+      
+      return {
+        chart_data: chartData,
+        analysis_text: analysisText
+      };
+    } else {
+      // 普通JSON响应（兼容旧版本）
+      const result = await response.json();
+      
+      if (!result.success) {
+        throw new Error(result.error || '生成K线图失败');
+      }
+
+      return result.data;
+    }
+  } catch (error) {
+    throw new Error(error.message || '请求失败');
   }
-  
-  // 如果所有重试都失败
-  throw lastError || new Error('生成K线图失败，请稍后重试');
 }
 
 /**
@@ -403,15 +357,10 @@ export async function saveFortuneBook(bookData) {
     console.log('调用保存API:', SAVE_FORTUNE_BOOK_API);
     console.log('发送的数据:', bookData);
     
-    // 添加用户身份信息
-    const authHeader = getAuthHeader();
-    const url = addUserIdToUrl(SAVE_FORTUNE_BOOK_API);
-    
-    const response = await fetch(url, {
+    const response = await fetch(SAVE_FORTUNE_BOOK_API, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeader,
       },
       body: JSON.stringify(bookData),
     });
@@ -471,15 +420,10 @@ export async function saveFortuneBook(bookData) {
  */
 export async function deleteFortuneBook(bookId) {
   try {
-    // 添加用户身份信息
-    const authHeader = getAuthHeader();
-    const url = addUserIdToUrl(`${DELETE_FORTUNE_BOOK_API}/${bookId}`);
-    
-    const response = await fetch(url, {
+    const response = await fetch(`${DELETE_FORTUNE_BOOK_API}/${bookId}`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeader,
       },
     });
 
