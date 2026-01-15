@@ -300,74 +300,89 @@ export async function generateKLineChart(payload, onProgress = null) {
       // 添加60秒超时（增加超时时间）
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000);
-    
-    try {
-      const response = await fetch(GENERATE_KLINE_API, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal, // 添加超时控制
-      });
       
-      clearTimeout(timeoutId);
+      try {
+        const response = await fetch(GENERATE_KLINE_API, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal, // 添加超时控制
+        });
+        
+        clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const error = new Error(errorData.detail || `HTTP error! status: ${response.status}`);
-        error.status = response.status;
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          const error = new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
+
+        // 检查是否是流式响应
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('text/event-stream')) {
+          // 流式响应处理
+          let chartData = null;
+          let analysisText = '';
+          
+          await handleSSEStream(response, {
+            onProgress: (progress) => {
+              if (onProgress) {
+                onProgress(progress);
+              }
+            },
+            onChartData: (data) => {
+              chartData = data;
+            },
+            onComplete: (data) => {
+              if (data && data.chart_data) {
+                chartData = data.chart_data;
+                analysisText = data.analysis_text || '';
+              }
+            },
+            onError: (error) => {
+              throw new Error(error);
+            }
+          });
+          
+          if (!chartData) {
+            throw new Error('未收到K线图数据');
+          }
+          
+          return {
+            chart_data: chartData,
+            analysis_text: analysisText
+          };
+        } else {
+          // 普通JSON响应（兼容旧版本）
+          const result = await response.json();
+          
+          if (!result.success) {
+            throw new Error(result.error || '生成K线图失败');
+          }
+
+          return result.data;
+        }
+      } catch (error) {
+        clearTimeout(timeoutId);
         throw error;
       }
-
-    // 检查是否是流式响应
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('text/event-stream')) {
-      // 流式响应处理
-      let chartData = null;
-      let analysisText = '';
+    } catch (error) {
+      lastError = error;
+      console.error(`❌ 尝试 ${attempt + 1}/${maxRetries + 1} 失败:`, error);
       
-      await handleSSEStream(response, {
-        onProgress: (progress) => {
-          if (onProgress) {
-            onProgress(progress);
-          }
-        },
-        onChartData: (data) => {
-          chartData = data;
-        },
-        onComplete: (data) => {
-          if (data && data.chart_data) {
-            chartData = data.chart_data;
-            analysisText = data.analysis_text || '';
-          }
-        },
-        onError: (error) => {
-          throw new Error(error);
-        }
-      });
-      
-      if (!chartData) {
-        throw new Error('未收到K线图数据');
+      // 如果是最后一次尝试，或者错误不可重试，直接抛出
+      if (attempt === maxRetries || error.status === 400 || error.status === 404) {
+        throw new Error(error.message || '生成K线图失败，请稍后重试');
       }
-      
-      return {
-        chart_data: chartData,
-        analysis_text: analysisText
-      };
-    } else {
-      // 普通JSON响应（兼容旧版本）
-      const result = await response.json();
-      
-      if (!result.success) {
-        throw new Error(result.error || '生成K线图失败');
-      }
-
-      return result.data;
+      // 继续重试
     }
-  } catch (error) {
-    throw new Error(error.message || '请求失败');
   }
+  
+  // 如果所有重试都失败
+  throw lastError || new Error('生成K线图失败，请稍后重试');
 }
 
 /**
