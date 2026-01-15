@@ -2,6 +2,8 @@
  * API 工具函数
  */
 
+import { getAuthHeader, addUserIdToUrl } from './userAuth';
+
 // 支持环境变量，生产环境使用 Vercel 环境变量，开发环境使用 localhost
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const FORTUNE_API = `${API_BASE_URL}/api/fortune`;
@@ -239,10 +241,15 @@ export async function fetchBaziCalculation(formData) {
  */
 export async function getMyFortuneBooks() {
   try {
-    const response = await fetch(MY_FORTUNE_BOOKS_API, {
+    // 添加用户身份信息
+    const authHeader = getAuthHeader();
+    const url = addUserIdToUrl(MY_FORTUNE_BOOKS_API);
+    
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
+        ...authHeader,
       },
     });
 
@@ -357,10 +364,15 @@ export async function saveFortuneBook(bookData) {
     console.log('调用保存API:', SAVE_FORTUNE_BOOK_API);
     console.log('发送的数据:', bookData);
     
-    const response = await fetch(SAVE_FORTUNE_BOOK_API, {
+    // 添加用户身份信息
+    const authHeader = getAuthHeader();
+    const url = addUserIdToUrl(SAVE_FORTUNE_BOOK_API);
+    
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...authHeader,
       },
       body: JSON.stringify(bookData),
     });
@@ -420,10 +432,15 @@ export async function saveFortuneBook(bookData) {
  */
 export async function deleteFortuneBook(bookId) {
   try {
-    const response = await fetch(`${DELETE_FORTUNE_BOOK_API}/${bookId}`, {
+    // 添加用户身份信息
+    const authHeader = getAuthHeader();
+    const url = addUserIdToUrl(`${DELETE_FORTUNE_BOOK_API}/${bookId}`);
+    
+    const response = await fetch(url, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
+        ...authHeader,
       },
     });
 
