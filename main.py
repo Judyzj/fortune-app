@@ -2107,8 +2107,8 @@ async def generate_kline(
                 # 生成默认数据（兜底）
                 print(f"⚠️  使用默认数据（基于大运）", flush=True)
                 birth_year = datetime.strptime(birth_date, "%Y-%m-%d").year
-                current_year = datetime.now().year
-                current_age = current_year - birth_year
+            current_year = datetime.now().year
+            current_age = current_year - birth_year
             
             da_yun = bazi_report.get('da_yun', [])
             base_score = 60
@@ -2722,6 +2722,43 @@ async def chat_divination(request: ChatDivinationRequest):
             # 使用 chat.send_message() 发送消息并获取流式响应
             stream = chat.send_message(latest_content, stream=True)
             print(f"✅ 发送消息成功: {latest_content[:50]}...", flush=True)
+            
+            # 流式返回结果
+            async def generate_response():
+                full_text = ""
+                try:
+                    for chunk in stream:
+                        chunk_text = ""
+                        if hasattr(chunk, 'text'):
+                            chunk_text = chunk.text
+                        elif hasattr(chunk, 'candidates') and chunk.candidates:
+                            if hasattr(chunk.candidates[0], 'content'):
+                                if hasattr(chunk.candidates[0].content, 'parts'):
+                                    for part in chunk.candidates[0].content.parts:
+                                        if hasattr(part, 'text'):
+                                            chunk_text += part.text
+                        
+                        if chunk_text:
+                            full_text += chunk_text
+                            yield f"data: {json.dumps({'type': 'text', 'content': chunk_text}, ensure_ascii=False)}\n\n"
+                    
+                    # 发送完成标记
+                    yield "data: [DONE]\n\n"
+                    print(f"✅ 起卦对话完成，总长度: {len(full_text)} 字符", flush=True)
+                    
+                except Exception as e:
+                    print(f"❌ 流式输出错误: {e}", flush=True)
+                    yield f"data: {json.dumps({'type': 'error', 'content': f'生成错误: {str(e)}'}, ensure_ascii=False)}\n\n"
+            
+            return StreamingResponse(
+                generate_response(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
             
         except Exception as e:
             print(f"❌ 创建聊天会话或发送消息失败: {e}", flush=True)
